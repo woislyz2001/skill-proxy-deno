@@ -1,16 +1,15 @@
-// 辰于咨询 SKILL 代理 — Deno Deploy v3（完整版）
-// 环境变量: GITHUB_TOKEN
-// 架构: WorkBuddy 通过 /exec 接口获取完整 SKILL 内容执行，用户无法直接访问原文
+// 辰于咨询 SKILL 代理 — Deno Deploy v4（安全加固版）
+// 环境变量: GITHUB_TOKEN, EXEC_KEY
+// /exec 需要 EXEC_KEY 认证，/skill 已移除
 
 const GITHUB_TOKEN = Deno.env.get("GITHUB_TOKEN") || "";
+const EXEC_KEY = Deno.env.get("EXEC_KEY") || "";
 const GITHUB_REPO = "woislyz2001/chenyu-skills";
 
-// ===== 缓存 =====
 let catalogCache: { name: string; folder: string; path: string }[] | null = null;
 let cacheTime = 0;
 const CACHE_TTL = 5 * 60 * 1000;
 
-// ===== 扫描仓库 =====
 async function buildCatalog() {
   const now = Date.now();
   if (catalogCache && (now - cacheTime) < CACHE_TTL) return catalogCache;
@@ -34,14 +33,9 @@ async function buildCatalog() {
         !item.path.endsWith("AGENT_RULES.md") &&
         !item.path.includes(".sync-log")) {
       const parts = item.path.split("/");
-      const fileName = parts[parts.length - 1].replace(".md", "");
+      const name = parts[parts.length - 1].replace(".md", "");
       const folder = parts.slice(0, -1).join("/");
-
-      items.push({
-        name: fileName,
-        folder: folder,
-        path: item.path,
-      });
+      items.push({ name, folder, path: item.path });
     }
   }
 
@@ -50,15 +44,12 @@ async function buildCatalog() {
   return items;
 }
 
-// ===== 读取 SKILL 完整内容 =====
 async function fetchSkill(name: string) {
   const catalog = await buildCatalog();
   const skill = catalog.find(s => s.name === name);
-
   if (!skill) return null;
 
   const url = `https://api.github.com/repos/${GITHUB_REPO}/contents/${encodeURI(skill.path)}`;
-
   const resp = await fetch(url, {
     headers: {
       Authorization: `token ${GITHUB_TOKEN}`,
@@ -76,7 +67,6 @@ async function fetchSkill(name: string) {
   };
 }
 
-// ===== CORS =====
 function corsHeaders() {
   return {
     "Access-Control-Allow-Origin": "*",
@@ -85,7 +75,6 @@ function corsHeaders() {
   };
 }
 
-// ===== 路由 =====
 Deno.serve(async (req) => {
   const url = new URL(req.url);
   const path = url.pathname;
@@ -95,79 +84,46 @@ Deno.serve(async (req) => {
     return new Response(null, { status: 204, headers });
   }
 
-  // GET / — 健康检查
+  // GET / — 健康检查（仅返回版本，不暴露 SKILL 数量）
   if (path === "/" && req.method === "GET") {
-    const catalog = await buildCatalog();
-    return Response.json({
-      service: "Chenyu SKILL Proxy (Deno)",
-      version: "3.0.0",
-      skillsCount: catalog.length,
-      status: "ok"
-    }, { headers });
+    return Response.json({ status: "ok" }, { headers });
   }
 
-  // GET /skills — 列出所有 SKILL（公开，只有名称和分类）
+  // GET /skills — 列出所有 SKILL（仅名称，不含分类和路径）
   if (path === "/skills" && req.method === "GET") {
     const catalog = await buildCatalog();
-    const list = catalog.map(s => ({
-      name: s.name,
-      folder: s.folder,
-    }));
+    const list = catalog.map(s => s.name);
     return Response.json({ skills: list }, { headers });
   }
 
-  // GET /skill?name=xxx — 获取 SKILL 摘要（公开，不含原文）
-  if (path === "/skill" && req.method === "GET") {
-    const name = url.searchParams.get("name");
-    if (!name) {
-      return Response.json({ error: "Missing name param" }, { status: 400, headers });
-    }
-
-    const info = await fetchSkill(name);
-    if (!info) {
-      return Response.json({ error: `SKILL "${name}" not found` }, { status: 404, headers });
-    }
-
-    // 只返回摘要，不返回 content
-    return Response.json({
-      success: true,
-      skill: {
-        name: info.name,
-        folder: info.folder,
-        totalChars: info.content.length
-      }
-    }, { headers });
-  }
-
-  // GET /exec?name=xxx — 获取完整 SKILL 内容（仅 WorkBuddy 内部调用）
-  // 这个接口返回完整内容供 WorkBuddy 执行，但用户在对话中看不到原始 JSON
+  // GET /exec?name=xxx — 获取完整内容（需要 EXEC_KEY）
   if (path === "/exec" && req.method === "GET") {
+    if (EXEC_KEY) {
+      const key = req.headers.get("X-Exec-Key") || url.searchParams.get("key") || "";
+      if (key !== EXEC_KEY) {
+        return Response.json({ error: "Forbidden" }, { status: 403, headers });
+      }
+    }
+
     const name = url.searchParams.get("name");
     if (!name) {
-      return Response.json({ error: "Missing name param" }, { status: 400, headers });
+      return Response.json({ error: "Missing name" }, { status: 400, headers });
     }
 
     const info = await fetchSkill(name);
     if (!info) {
-      return Response.json({ error: `SKILL "${name}" not found` }, { status: 404, headers });
+      return Response.json({ error: "Not found" }, { status: 404, headers });
     }
 
-    // 返回完整内容，WorkBuddy 读取后按 AGENT_RULES 执行
     return Response.json({
-      success: true,
       skill: {
         name: info.name,
-        folder: info.folder,
         content: info.content,
-        totalChars: info.content.length
+        folder: info.folder,
       }
     }, { headers });
   }
 
-  // GET /raw — 禁止，AGENT_RULES 保护
-  if (path === "/raw" && req.method === "GET") {
-    return Response.json({ error: "Forbidden" }, { status: 403, headers });
-  }
-
+  // 其他路径一律 404，不暴露任何信息
   return Response.json({ error: "Not Found" }, { status: 404, headers });
 });
